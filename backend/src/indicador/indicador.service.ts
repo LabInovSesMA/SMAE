@@ -760,6 +760,8 @@ export class IndicadorService {
                 where: {
                     indicador_origem_id: id,
                     desativado: false,
+                    indicador: { removido_em: null },
+                    variavel: { removido_em: null },
                 },
             });
 
@@ -779,30 +781,45 @@ export class IndicadorService {
             // Coleta as equipes que respondem pelas variáveis deste indicador ANTES do soft-delete,
             // para recalcular os perfis das pessoas afetadas (recalculaPessoaPdmTipos ignora variáveis
             // removidas, então elas ficariam "presas" ao indicador removido até o recalc-equipe rodar).
+            const variaveisProprias: Prisma.VariavelWhereInput = {
+                removido_em: null,
+                tipo: 'PDM',
+                indicador_variavel: { some: { indicador_id: id, indicador_origem_id: null } },
+            };
+            const vinculadas = await prismaTx.indicadorVariavel.findMany({
+                where: {
+                    indicador_id: id,
+                    indicador_origem_id: null,
+                    variavel: { tipo: { in: ['Global', 'Calculada'] } },
+                },
+                select: { variavel_id: true },
+            });
+            const vinculadasIds = vinculadas.map((v) => v.variavel_id);
+
             const vinculosVar = await prismaTx.variavelGrupoResponsavelEquipe.findMany({
                 where: {
                     removido_em: null,
-                    variavel: {
-                        removido_em: null,
-                        indicador_variavel: { some: { indicador_id: id } },
-                    },
+                    OR: [{ variavel: variaveisProprias }, { variavel_id: { in: vinculadasIds } }],
                 },
                 select: { grupo_responsavel_equipe_id: true },
             });
 
             await prismaTx.variavel.updateMany({
-                where: {
-                    indicador_variavel: {
-                        some: {
-                            indicador_id: id,
-                        },
-                    },
-                },
+                where: variaveisProprias,
                 data: {
                     removido_em: new Date(Date.now()),
                     removido_por: user.id,
                 },
             });
+
+            if (vinculadasIds.length) {
+                await AddTaskRecalcVariaveis(prismaTx, { variavelIds: vinculadasIds });
+                await AddTaskRefreshMeta(prismaTx, { indicador_id: id });
+
+                await prismaTx.indicadorVariavel.deleteMany({
+                    where: { indicador_id: id, indicador_origem_id: null, variavel_id: { in: vinculadasIds } },
+                });
+            }
 
             await recalcPessoasAfetadasPorEquipes(
                 vinculosVar.map((v) => v.grupo_responsavel_equipe_id),
